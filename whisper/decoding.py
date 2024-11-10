@@ -118,6 +118,8 @@ class DecodingOptions:
 class DecodingResult:
     audio_features: Tensor
     language: str
+    encoder_embeddings: np.ndarray
+    decoder_embeddings: np.ndarray
     language_probs: Optional[Dict[str, float]] = None
     tokens: List[int] = field(default_factory=list)
     text: str = ""
@@ -152,7 +154,7 @@ class PyTorchInference(Inference):
         value_modules = [block.attn.value for block in self.model.decoder.blocks]
         self.kv_modules = key_modules + value_modules
 
-    def logits(self, tokens: Tensor, audio_features: Tensor) -> Tensor:
+    def logits(self, tokens: Tensor, audio_features: Tensor, include_embeddings: bool = False) -> Tensor:
         if not self.kv_cache:
             self.kv_cache, self.hooks = self.model.install_kv_cache_hooks()
 
@@ -160,7 +162,11 @@ class PyTorchInference(Inference):
             # only need to use the last token except in the first forward pass
             tokens = tokens[:, -1:]
 
-        return self.model.decoder(tokens, audio_features, kv_cache=self.kv_cache)
+        return self.model.decoder(
+            tokens, audio_features,
+            kv_cache=self.kv_cache,
+            include_embeddings=include_embeddings
+        )
 
     def cleanup_caching(self):
         for hook in self.hooks:
@@ -641,7 +647,8 @@ class DecodingTask:
 
         return tuple(sorted(set(suppress_tokens)))
 
-    def _get_audio_features(self, mel: Tensor):
+    def _get_audio_features(self, mel: Tensor, include_embeddings: bool = False):
+        embeddings = None
         if self.options.fp16:
             mel = mel.half()
 
@@ -652,7 +659,11 @@ class DecodingTask:
             # encoded audio features are given; skip audio encoding
             audio_features = mel
         else:
-            audio_features = self.model.encoder(mel)
+            result = self.model.encoder(mel, include_embeddings)
+            if include_embeddings:
+                audio_features, embeddings = result
+            else:
+                audio_features = result
 
         if audio_features.dtype != (
             torch.float16 if self.options.fp16 else torch.float32
@@ -661,7 +672,10 @@ class DecodingTask:
                 f"audio_features has an incorrect dtype: {audio_features.dtype}"
             )
 
-        return audio_features
+        if include_embeddings:
+            return audio_features, embeddings
+        else:
+            return audio_features
 
     def _detect_language(self, audio_features: Tensor, tokens: Tensor):
         languages = [self.options.language] * audio_features.shape[0]
@@ -682,9 +696,11 @@ class DecodingTask:
         sum_logprobs: Tensor = torch.zeros(n_batch, device=audio_features.device)
         no_speech_probs = [np.nan] * n_batch
 
+        completed = False
+        embeddings = []
         try:
             for i in range(self.sample_len):
-                logits = self.inference.logits(tokens, audio_features)
+                logits, token_embeddings = self.inference.logits(tokens, audio_features, include_embeddings=True)
 
                 if (
                     i == 0 and self.tokenizer.no_speech is not None
@@ -694,6 +710,10 @@ class DecodingTask:
 
                 # now we need to consider the logits at the last token only
                 logits = logits[:, -1]
+                token_embeddings = token_embeddings[:, :, -1]
+
+                # Append embeddings together
+                embeddings.append(token_embeddings)
 
                 # apply the logit filters, e.g. for suppressing or applying penalty to
                 for logit_filter in self.logit_filters:
@@ -705,9 +725,12 @@ class DecodingTask:
                 if completed or tokens.shape[-1] > self.n_ctx:
                     break
         finally:
+            if completed:
+                embeddings = embeddings[:-1]
+            embeddings = np.stack(embeddings, 2)
             self.inference.cleanup_caching()
 
-        return tokens, sum_logprobs, no_speech_probs
+        return tokens, sum_logprobs, no_speech_probs, embeddings
 
     @torch.no_grad()
     def run(self, mel: Tensor) -> List[DecodingResult]:
@@ -715,7 +738,9 @@ class DecodingTask:
         tokenizer: Tokenizer = self.tokenizer
         n_audio: int = mel.shape[0]
 
-        audio_features: Tensor = self._get_audio_features(mel)  # encoder forward pass
+        # encoder forward pass
+        forward_pass: Tuple[Tensor, np.ndarray] = self._get_audio_features(mel, include_embeddings=True)
+        audio_features, encoder_embeddings = forward_pass
         tokens: Tensor = torch.tensor([self.initial_tokens]).repeat(n_audio, 1)
 
         # detect language if requested, overwriting the language token
@@ -734,7 +759,7 @@ class DecodingTask:
         tokens = tokens.repeat_interleave(self.n_group, dim=0).to(audio_features.device)
 
         # call the main sampling loop
-        tokens, sum_logprobs, no_speech_probs = self._main_loop(audio_features, tokens)
+        tokens, sum_logprobs, no_speech_probs, decoder_embeddings = self._main_loop(audio_features, tokens)
 
         # reshape the tensors to have (n_audio, n_group) as the first two dimensions
         audio_features = audio_features[:: self.n_group]
@@ -782,6 +807,8 @@ class DecodingTask:
                 no_speech_prob=no_speech_prob,
                 temperature=self.options.temperature,
                 compression_ratio=compression_ratio(text),
+                encoder_embeddings=encoder_embeddings,
+                decoder_embeddings=decoder_embeddings
             )
             for text, language, tokens, features, avg_logprob, no_speech_prob in zip(
                 *fields
